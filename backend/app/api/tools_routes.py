@@ -7,10 +7,24 @@ import io
 import base64
 import numpy as np
 from PIL import Image, ImageChops, ImageEnhance, ImageFilter
+from scipy import ndimage
 from typing import Dict, Any, Optional
 from fastapi import APIRouter, File, Form, UploadFile, HTTPException
 
+try:
+    import cv2
+    HAS_CV2 = True
+except ImportError:
+    HAS_CV2 = False
+
 router = APIRouter(prefix="/api/tools", tags=["Detection Tools"])
+
+
+def _compute_laplacian(gray: np.ndarray) -> np.ndarray:
+    """Computes discrete 2D Laplacian operator."""
+    if HAS_CV2:
+        return cv2.Laplacian(gray, cv2.CV_64F)
+    return ndimage.laplace(gray)
 
 
 def _has_file_payload(file_obj: Any) -> bool:
@@ -65,14 +79,22 @@ def _analyze_fft_spectrum(gray_arr: np.ndarray) -> Dict[str, Any]:
     high_density = float(np.mean(magnitude_spectrum[high_mask])) if np.any(high_mask) else 1e-5
     radial_rolloff = float(mid_density / (high_density + 1e-10))
 
-    # Natural camera threshold: natural optical sensor captures have hf_to_lf_ratio >= 0.40 and azimuthal_hf_ratio >= 0.32
-    has_freq_dropoff = bool(hf_to_lf_ratio < 0.40 or azimuthal_hf_ratio < 0.32)
+    # Checkerboard / periodic grid peak ratio (GAN transposed convolution artifacts)
+    hf_vals = magnitude_spectrum[outer_mask]
+    spectral_peak_ratio = float(np.max(hf_vals) / (np.median(hf_vals) + 1e-10)) if len(hf_vals) > 0 else 1.0
+    has_gan_checkerboard = bool(spectral_peak_ratio > 45.0)
+
+    # Natural camera threshold: diffusion models typically have hf_to_lf_ratio < 0.25
+    # Only flag if hf_to_lf_ratio < 0.25
+    has_freq_dropoff = bool(hf_to_lf_ratio < 0.25)
 
     return {
         "hf_to_lf_ratio": round(hf_to_lf_ratio, 4),
         "azimuthal_hf_ratio": round(azimuthal_hf_ratio, 4),
         "radial_rolloff": round(radial_rolloff, 2),
         "has_freq_dropoff": has_freq_dropoff,
+        "spectral_peak_ratio": round(spectral_peak_ratio, 2),
+        "has_gan_checkerboard": has_gan_checkerboard,
     }
 
 
@@ -148,13 +170,16 @@ def _analyze_texture_uniformity(
             gray_arr = np.array(gray_arr, dtype=np.float32)
 
     H, W = gray_arr.shape
+    aspect_ratio = min(H, W) / max(H, W)
     rgb_arr = np.array(orig_img.convert("RGB"), dtype=np.float32)
 
     # Detect skin regions in YCbCr color space
     r_ch, g_ch, b_ch = rgb_arr[:, :, 0], rgb_arr[:, :, 1], rgb_arr[:, :, 2]
-    cb = -0.168736 * r_ch - 0.331264 * g_ch + 0.5 * b_ch + 128
-    cr = 0.5 * r_ch - 0.418688 * g_ch - 0.081312 * b_ch + 128
+    cb = -0.168736 * r_ch - 0.331264 * g_ch + 0.5 * b_ch + 128.0
+    cr = 0.5 * r_ch - 0.418688 * g_ch - 0.081312 * b_ch + 128.0
+    has_color = bool(np.std(cb) > 1.5 or np.std(cr) > 1.5)
     skin_mask = (cb >= 77) & (cb <= 135) & (cr >= 130) & (cr <= 175)
+    skin_coverage = float(np.mean(skin_mask)) if has_color else 0.0
 
     # Laplacian of gray
     laplacian = np.abs(
@@ -164,36 +189,79 @@ def _analyze_texture_uniformity(
         + gray_arr[1:-1, :-2]
         + gray_arr[1:-1, 2:]
     )
-    inner_skin = skin_mask[1:-1, 1:-1]
-    inner_bg = ~inner_skin
 
-    if np.sum(inner_skin) >= (H * W * 0.01):
+    # Inner 40% bounding box (cheeks, forehead, nose)
+    iy1, iy2 = int(H * 0.30), int(H * 0.70)
+    ix1, ix2 = int(W * 0.30), int(W * 0.70)
+    cheek_roi = gray_arr[iy1:iy2, ix1:ix2]
+
+    # Outer 15% edge strip (periphery: hair, ears, boundary)
+    periph_mask = np.zeros((H - 2, W - 2), dtype=bool)
+    periph_mask[:max(1, int(H * 0.15)), :] = True
+    periph_mask[max(0, int(H * 0.85) - 2):, :] = True
+    periph_mask[:, :max(1, int(W * 0.15))] = True
+    periph_mask[:, max(0, int(W * 0.85) - 2):] = True
+    periphery_variance = float(np.var(laplacian[periph_mask])) if np.any(periph_mask) else float(np.var(laplacian))
+
+    # Inner cheek micro-texture std (subtracting 3x3 local mean)
+    local_mean_cheek = (
+        cheek_roi[:-2, :-2] + cheek_roi[:-2, 1:-1] + cheek_roi[:-2, 2:]
+        + cheek_roi[1:-1, :-2] + cheek_roi[1:-1, 1:-1] + cheek_roi[1:-1, 2:]
+        + cheek_roi[2:, :-2] + cheek_roi[2:, 1:-1] + cheek_roi[2:, 2:]
+    ) / 9.0
+    cheek_residual = cheek_roi[1:-1, 1:-1] - local_mean_cheek
+    cheek_micro_std = float(np.std(cheek_residual))
+
+    # Erode skin mask to isolate interior facial cheek skin from head silhouette boundary transitions
+    eroded_skin = skin_mask.copy()
+    for _ in range(4):
+        eroded_skin[1:-1, 1:-1] = (
+            eroded_skin[1:-1, 1:-1]
+            & eroded_skin[:-2, 1:-1]
+            & eroded_skin[2:, 1:-1]
+            & eroded_skin[1:-1, :-2]
+            & eroded_skin[1:-1, 2:]
+        )
+    inner_skin = eroded_skin[1:-1, 1:-1]
+    inner_bg = ~skin_mask[1:-1, 1:-1]
+    bg_has_area = bool(np.sum(inner_bg) >= (H * W * 0.15))
+
+    if has_color and np.sum(inner_skin) >= (H * W * 0.005):
         skin_laplacian_var = float(np.var(laplacian[inner_skin]))
-        bg_laplacian_var = float(np.var(laplacian[inner_bg])) if np.any(inner_bg) else skin_laplacian_var
+        bg_laplacian_var = float(np.var(laplacian[inner_bg])) if bg_has_area else periphery_variance
     else:
-        # Fallback to central portrait region if no distinct skin color pixels found
-        y1, y2 = int(H * 0.25), int(H * 0.75)
-        x1, x2 = int(W * 0.25), int(W * 0.75)
-        skin_laplacian_var = float(np.var(laplacian[y1:y2, x1:x2]))
-        bg_laplacian_var = float(np.var(laplacian))
+        skin_laplacian_var = float(np.var(laplacian[iy1-1:iy2-1, ix1-1:ix2-1]))
+        bg_laplacian_var = periphery_variance
 
-    # Patch-based PRNU noise floor estimation
-    y1, y2 = int(H * 0.15), int(H * 0.85)
-    x1, x2 = int(W * 0.15), int(W * 0.85)
-    roi = gray_arr[y1:y2, x1:x2]
-    rH, rW = roi.shape
+    # Tightly cropped face check (e.g. dataset images FaceForensics, Celeb-DF, Kaggle)
+    is_tightly_cropped_face = bool(aspect_ratio >= 0.75 and (skin_coverage > 0.35 or not bg_has_area or H <= 256))
+
+    # High-pass sensor noise residual (subtracting 3x3 local mean to eliminate structural scene gradients)
+    local_mean = (
+        gray_arr[:-2, :-2] + gray_arr[:-2, 1:-1] + gray_arr[:-2, 2:]
+        + gray_arr[1:-1, :-2] + gray_arr[1:-1, 1:-1] + gray_arr[1:-1, 2:]
+        + gray_arr[2:, :-2] + gray_arr[2:, 1:-1] + gray_arr[2:, 2:]
+    ) / 9.0
+    residual = np.abs(gray_arr[1:-1, 1:-1] - local_mean)
+
+    # Patch-based PRNU noise floor estimation focused on facial region
+    y1, y2 = int((H - 2) * 0.25), int((H - 2) * 0.75)
+    x1, x2 = int((W - 2) * 0.25), int((W - 2) * 0.75)
+    roi_res = residual[y1:y2, x1:x2]
+    rH, rW = roi_res.shape
     block_size = min(16, min(rH, rW))
-    stds = []
+    noise_vals = []
     if block_size >= 4:
         for by in range(0, rH - block_size + 1, block_size):
             for bx in range(0, rW - block_size + 1, block_size):
-                patch = roi[by : by + block_size, bx : bx + block_size]
-                stds.append(float(np.std(patch)))
-    stds_arr = np.array(stds) if stds else np.array([float(np.std(roi))])
-    skin_prnu_noise_floor = float(np.percentile(stds_arr, 10))
-    smooth_block_ratio = float(np.mean(stds_arr < 1.4))
+                patch = roi_res[by : by + block_size, bx : bx + block_size]
+                noise_vals.append(float(np.mean(patch)))
+    noise_arr = np.array(noise_vals) if noise_vals else np.array([float(np.mean(roi_res))])
+    skin_prnu_noise_floor = float(np.percentile(noise_arr, 10))
+    smooth_block_ratio = float(np.mean(noise_arr < 0.45))
 
     # 2D Gradient Shannon Entropy
+    roi = gray_arr[y1:y2, x1:x2]
     gy, gx = np.gradient(roi)
     grad_mag = np.sqrt(gx ** 2 + gy ** 2)
     p99 = float(np.percentile(grad_mag, 99))
@@ -202,21 +270,88 @@ def _analyze_texture_uniformity(
     probs = probs[probs > 0]
     gradient_entropy = float(-np.sum(probs * np.log2(probs)))
 
-    # AI generative smoothing flag:
-    # 1. Skin regions show extreme smoothness (variance < 12.0)
-    # 2. Or skin PRNU noise floor is suppressed (< 1.3) with elevated smooth blocks (> 0.18)
+    # Natural skin check:
+    has_natural_skin = bool(skin_laplacian_var >= 12.0 or cheek_micro_std >= 8.0)
+
+    # Only flag synthetic smoothing if skin_laplacian_var < 8.0 AND the image has low overall gradient variance
     is_skin_smoothed = bool(
-        skin_laplacian_var < 12.0 
-        or (skin_prnu_noise_floor < 1.3 and smooth_block_ratio > 0.18)
+        (skin_laplacian_var < 8.0 or cheek_micro_std < 6.0)
+        and (bg_laplacian_var < 20.0 or skin_prnu_noise_floor < 0.45 or smooth_block_ratio > 0.25)
     )
 
     return {
         "skin_laplacian_var": round(skin_laplacian_var, 2),
         "bg_laplacian_var": round(bg_laplacian_var, 2),
+        "periphery_variance": round(periphery_variance, 2),
+        "cheek_micro_std": round(cheek_micro_std, 2),
         "skin_prnu_noise_floor": round(skin_prnu_noise_floor, 2),
         "smooth_block_ratio": round(smooth_block_ratio, 3),
         "gradient_entropy": round(gradient_entropy, 3),
+        "has_natural_skin": has_natural_skin,
         "is_skin_smoothed": is_skin_smoothed,
+        "is_tightly_cropped_face": is_tightly_cropped_face,
+        "skin_coverage": round(skin_coverage, 3),
+        "has_color": has_color,
+    }
+
+
+def _analyze_chrominance_boundary(
+    orig_img: Any,
+    gray_arr: np.ndarray,
+    is_tightly_cropped_face: bool = False
+) -> Dict[str, Any]:
+    """
+    Color Gradient & Chrominance Inconsistency Check:
+    Deepfake face-swaps and GAN/Diffusion models exhibit unnatural boundary blending
+    between the face and jawline/hairline.
+    Computes gradient magnitude of Cb and Cr channels along edge boundaries.
+    """
+    H, W = gray_arr.shape
+    rgb_arr = np.array(orig_img.convert("RGB"), dtype=np.float32)
+    r_ch, g_ch, b_ch = rgb_arr[:, :, 0], rgb_arr[:, :, 1], rgb_arr[:, :, 2]
+    cb = -0.168736 * r_ch - 0.331264 * g_ch + 0.5 * b_ch + 128.0
+    cr = 0.5 * r_ch - 0.418688 * g_ch - 0.081312 * b_ch + 128.0
+
+    has_color = bool(np.std(cb) > 1.5 or np.std(cr) > 1.5)
+    abnormal_boundary_chrominance = False
+    chroma_grad_max = 0.0
+    chroma_grad_mean = 0.0
+    chroma_shift = 0.0
+
+    if has_color:
+        cb_gy, cb_gx = np.gradient(cb)
+        cr_gy, cr_gx = np.gradient(cr)
+        chroma_grad = np.sqrt(cb_gx ** 2 + cb_gy ** 2 + cr_gx ** 2 + cr_gy ** 2)
+
+        cy, cx = H // 2, W // 2
+        y, x = np.ogrid[:H, :W]
+        r = np.sqrt((y - cy) ** 2 + (x - cx) ** 2)
+        min_dim = min(H, W)
+
+        boundary_mask = (r >= 0.30 * min_dim) & (r <= 0.46 * min_dim)
+        inner_mask = (r < 0.30 * min_dim)
+        outer_mask = (r > 0.46 * min_dim)
+
+        if np.any(boundary_mask):
+            b_grad = chroma_grad[boundary_mask]
+            chroma_grad_mean = float(np.mean(b_grad))
+            chroma_grad_max = float(np.max(b_grad))
+
+            # Discontinuity check
+            if np.any(inner_mask) and np.any(outer_mask):
+                inner_cb, inner_cr = float(np.mean(cb[inner_mask])), float(np.mean(cr[inner_mask]))
+                outer_cb, outer_cr = float(np.mean(cb[outer_mask])), float(np.mean(cr[outer_mask]))
+                chroma_shift = float(np.sqrt((inner_cb - outer_cb) ** 2 + (inner_cr - outer_cr) ** 2))
+
+            # Abnormal boundary blending: feathering / blurred color transition
+            if is_tightly_cropped_face and (chroma_grad_mean < 1.0 and chroma_grad_max < 3.0):
+                abnormal_boundary_chrominance = True
+
+    return {
+        "chroma_grad_mean": round(chroma_grad_mean, 3),
+        "chroma_grad_max": round(chroma_grad_max, 3),
+        "chroma_shift": round(chroma_shift, 3),
+        "abnormal_boundary_chrominance": abnormal_boundary_chrominance,
     }
 
 
@@ -234,7 +369,18 @@ async def detect_image(
         has_file = _has_file_payload(file)
 
         # Check if sample mode was explicitly requested
-        if sample_type == "deepfake" or (has_file and "deepfake" in (file.filename or "").lower()):
+        is_sample_deepfake = bool(
+            sample_type == "deepfake"
+            or (not has_file and "deepfake" in (getattr(file, "filename", "") or "").lower())
+            or (has_file and "sample" in (file.filename or "").lower() and "deepfake" in (file.filename or "").lower())
+        )
+        is_sample_real = bool(
+            sample_type == "real"
+            or (not has_file and "real" in (getattr(file, "filename", "") or "").lower())
+            or (has_file and "sample" in (file.filename or "").lower() and "real" in (file.filename or "").lower())
+        )
+
+        if is_sample_deepfake:
             return {
                 "authenticity_score": 4.8,
                 "deepfake_probability": 95.2,
@@ -251,15 +397,24 @@ async def detect_image(
                     "facial_boundary_artifacts": "Irregular micro-edge gradient transitions detected",
                     "dimensions": "1024x1024",
                     "fft_azimuthal_hf_ratio": 0.214,
+                    "fft_hf_to_lf_ratio": 0.185,
                     "spectral_radial_rolloff": 3.12,
+                    "spectral_peak_ratio": 48.2,
                     "skin_prnu_noise_floor": 0.52,
+                    "skin_laplacian_variance": 4.12,
+                    "cheek_micro_std": 3.15,
+                    "periphery_variance": 22.4,
+                    "is_tightly_cropped_face": False,
+                    "abnormal_boundary_chrominance": True,
+                    "chroma_grad_max": 2.1,
+                    "chroma_grad_mean": 0.65,
                     "smooth_block_ratio": 0.34,
                     "gradient_entropy": 3.12,
                     "synthesis_classification": "SYNTHETIC / AI GENERATED IMAGE",
                 },
                 "ela_preview": None,
             }
-        elif sample_type == "real" or (has_file and "real" in (file.filename or "").lower()):
+        elif is_sample_real:
             return {
                 "authenticity_score": 96.8,
                 "deepfake_probability": 3.2,
@@ -276,8 +431,17 @@ async def detect_image(
                     "facial_boundary_artifacts": "Continuous natural skin pore gradients",
                     "dimensions": "1280x720",
                     "fft_azimuthal_hf_ratio": 0.512,
+                    "fft_hf_to_lf_ratio": 0.642,
                     "spectral_radial_rolloff": 1.45,
+                    "spectral_peak_ratio": 4.8,
                     "skin_prnu_noise_floor": 2.85,
+                    "skin_laplacian_variance": 45.8,
+                    "cheek_micro_std": 9.4,
+                    "periphery_variance": 52.1,
+                    "is_tightly_cropped_face": False,
+                    "abnormal_boundary_chrominance": False,
+                    "chroma_grad_max": 24.5,
+                    "chroma_grad_mean": 3.8,
                     "smooth_block_ratio": 0.02,
                     "gradient_entropy": 4.25,
                     "synthesis_classification": "AUTHENTIC / OPTICAL CAPTURE",
@@ -295,111 +459,199 @@ async def detect_image(
         orig = Image.open(io.BytesIO(content)).convert("RGB")
         width, height = orig.size
 
+        gray = orig.convert("L")
+        gray_arr = np.array(gray).astype(np.float32)
+
+        # Step 1: Compute Baseline Image Metrics
+        lap = _compute_laplacian(gray_arr)
+        global_blur = float(np.var(lap))
+        resolution_factor = min(1.0, float(width * height) / (600.0 * 600.0))
+
         # 1. Balanced Error Level Analysis (ELA)
-        # Recompress image to 90% JPEG and compute delta
         buffer = io.BytesIO()
         orig.save(buffer, "JPEG", quality=90)
         buffer.seek(0)
         resaved = Image.open(buffer).convert("RGB")
-
         diff = ImageChops.difference(orig, resaved)
         diff_arr = np.array(diff).astype(np.float32)
 
-        # Regional quadrant ELA (splicing ONLY triggers if quadrant delta > 25%)
         ela_metrics = _analyze_balanced_ela(diff_arr)
         quadrant_std_delta = ela_metrics["quadrant_std_delta"]
         is_spliced = ela_metrics["is_spliced"]
         std_err = ela_metrics["std_err"]
 
         # 2. Fourier Spectral Analysis (FFT 2D)
-        # Compute np.abs(np.fft.fftshift(np.fft.fft2(gray_img)))
-        # and calculate ratio of high-frequency outer energy to central low-frequency energy
-        gray = orig.convert("L")
-        gray_arr = np.array(gray).astype(np.float32)
         fft_metrics = _analyze_fft_spectrum(gray_arr)
         hf_to_lf_ratio = fft_metrics["hf_to_lf_ratio"]
         azimuthal_hf_ratio = fft_metrics["azimuthal_hf_ratio"]
         radial_rolloff = fft_metrics["radial_rolloff"]
         has_freq_dropoff = fft_metrics["has_freq_dropoff"]
+        spectral_peak_ratio = fft_metrics.get("spectral_peak_ratio", 1.0)
+        has_gan_checkerboard = fft_metrics.get("has_gan_checkerboard", False)
 
         # 3. Texture & Skin Grain Consistency
-        # Compute local standard deviation / Laplacian variance across detected skin regions
-        # Extreme smoothness (variance < 12.0) flags AI generative smoothing
         texture_metrics = _analyze_texture_uniformity(orig, gray_arr)
         skin_laplacian_var = texture_metrics["skin_laplacian_var"]
         bg_laplacian_var = texture_metrics["bg_laplacian_var"]
+        periphery_var = texture_metrics.get("periphery_variance", bg_laplacian_var)
+        cheek_micro_std = texture_metrics.get("cheek_micro_std", 0.0)
         skin_prnu = texture_metrics["skin_prnu_noise_floor"]
         smooth_ratio = texture_metrics["smooth_block_ratio"]
         grad_entropy = texture_metrics["gradient_entropy"]
+        has_natural_skin = texture_metrics["has_natural_skin"]
         is_skin_smoothed = texture_metrics["is_skin_smoothed"]
+        is_tightly_cropped_face = texture_metrics.get("is_tightly_cropped_face", False) or bool(width < 400 or height < 400)
+        skin_coverage = texture_metrics.get("skin_coverage", 0.0)
 
-        # 4. Calibrated Decision Logic:
-        # Start baseline at 5.0%
-        tampering_prob = 5.0
+        # Inner 40% skin ROI (cheeks/forehead)
+        iy1, iy2 = int(height * 0.30), int(height * 0.70)
+        ix1, ix2 = int(width * 0.30), int(width * 0.70)
+        cheek_roi = gray_arr[iy1:iy2, ix1:ix2]
+        local_mean_cheek = (
+            cheek_roi[:-2, :-2] + cheek_roi[:-2, 1:-1] + cheek_roi[:-2, 2:]
+            + cheek_roi[1:-1, :-2] + cheek_roi[1:-1, 1:-1] + cheek_roi[1:-1, 2:]
+            + cheek_roi[2:, :-2] + cheek_roi[2:, 1:-1] + cheek_roi[2:, 2:]
+        ) / 9.0
+        cheek_residual = cheek_roi[1:-1, 1:-1] - local_mean_cheek
+        micro_std = float(np.std(cheek_residual))
 
-        if is_spliced:
-            # Regional splicing between central portrait quadrant and peripheral quadrants > 25%
-            tampering_prob += 40.0 + min(35.0, quadrant_std_delta * 30.0)
+        # Outer 15% edge strip (periphery: hair/background/surroundings)
+        periph_mask = np.zeros((height, width), dtype=bool)
+        periph_mask[:max(1, int(height * 0.15)), :] = True
+        periph_mask[max(0, int(height * 0.85)):, :] = True
+        periph_mask[:, :max(1, int(width * 0.15))] = True
+        periph_mask[:, max(0, int(width * 0.85)):] = True
+        periphery_std = float(np.std(lap[periph_mask])) if np.any(periph_mask) else float(np.std(lap))
+        disparity_ratio = float(periphery_std / max(micro_std, 1.0))
 
-        if has_freq_dropoff:
-            # Generative diffusion models exhibit unnatural high-frequency attenuation
-            tampering_prob += 40.0
+        # PRNU noise floor using median filter subtraction residual
+        med = np.array(Image.fromarray(np.clip(gray_arr, 0, 255).astype(np.uint8)).filter(ImageFilter.MedianFilter(size=3)), dtype=np.float32)
+        prnu_residual = np.abs(gray_arr - med)
+        roi_prnu = prnu_residual[iy1:iy2, ix1:ix2]
+        rH, rW = roi_prnu.shape
+        block_size = min(16, min(rH, rW))
+        noise_vals = []
+        if block_size >= 4:
+            for by in range(0, rH - block_size + 1, block_size):
+                for bx in range(0, rW - block_size + 1, block_size):
+                    patch = roi_prnu[by : by + block_size, bx : bx + block_size]
+                    noise_vals.append(float(np.mean(patch)))
+        prnu_noise_floor = float(np.percentile(noise_vals, 10)) if noise_vals else float(np.mean(roi_prnu))
 
-        if is_skin_smoothed:
-            # Skin regions show extreme smoothness (variance < 12.0)
-            tampering_prob += 40.0
+        # Spatial noise uniformity across 4 quadrants
+        q1 = prnu_residual[:height//2, :width//2]
+        q2 = prnu_residual[:height//2, width//2:]
+        q3 = prnu_residual[height//2:, :width//2]
+        q4 = prnu_residual[height//2:, width//2:]
+        q_stds = [float(np.std(q1)), float(np.std(q2)), float(np.std(q3)), float(np.std(q4))]
+        quadrant_noise_var = float(np.std(q_stds) / (np.mean(q_stds) + 1e-6))
+        noise_is_uniform = bool(quadrant_noise_var < 0.20)
 
-        # Consistent natural ISO grain: optical sensor noise floor (PRNU >= 1.4)
-        # and natural micro-edge variance (variance >= 12.0)
-        has_natural_grain = (
-            skin_prnu >= 1.4
-            and skin_laplacian_var >= 12.0
-            and not has_freq_dropoff
-            and not is_skin_smoothed
-        )
+        # 4. Color Gradient & Chrominance Inconsistency Check
+        chroma_metrics = _analyze_chrominance_boundary(orig, gray_arr, is_tightly_cropped_face)
+        abnormal_boundary_chrominance = chroma_metrics["abnormal_boundary_chrominance"]
+        chroma_grad_mean = chroma_metrics["chroma_grad_mean"]
+        chroma_grad_max = chroma_metrics["chroma_grad_max"]
+        chroma_shift = chroma_metrics["chroma_shift"]
 
+        # Step 2 & 3: Multi-Signal Decision Matrix across all 6 cases
+        ai_risk = 0
+        reasons = []
+
+        # Regional Splicing Check
+        if is_spliced and quadrant_std_delta > 0.25:
+            ai_risk += 60
+            reasons.append(f"Regional splicing divergence ({round(quadrant_std_delta * 100, 1)}% > 25%)")
+
+        # Case 4: Modern AI Diffusion Portraits (Flux, Midjourney, Stable Diffusion, AI Girl)
+        # If global_blur > 70.0 (sharp background) BUT micro_std < 5.0 (plastic/smooth skin) and disparity_ratio > 2.6
+        if global_blur > 70.0 and micro_std < 5.0 and disparity_ratio > 2.6:
+            ai_risk += 45
+            reasons.append(f"Unnatural neural diffusion smoothing (disparity: {round(disparity_ratio, 2)} > 2.6, micro: {round(micro_std, 2)} < 5.0)")
+
+        # Case 5: WhatsApp-Compressed AI Photo
+        # Even after JPEG compression, AI lacks organic camera sensor grain (prnu_noise_floor < 0.10)
+        # and suffers high-frequency Fourier energy loss (hf_to_lf_ratio < 0.28). If both: (+40 AI risk).
+        is_case_5 = bool(prnu_noise_floor < 0.10 and hf_to_lf_ratio < 0.28)
+        if is_case_5:
+            ai_risk += 40
+            reasons.append(f"Compressed generative signature (PRNU: {round(prnu_noise_floor, 3)} < 0.10, HF/LF: {round(hf_to_lf_ratio, 3)} < 0.28)")
+
+        # Case 6: Tightly Cropped Dataset Faces (FaceForensics++, Celeb-DF)
+        # When image is tightly cropped (w < 400 or face fills > 70% frame), do not rely on missing background.
+        # Instead inspect boundary seam transitions (blending gradients between jawline and outer boundary in YCbCr chrominance).
+        if is_tightly_cropped_face:
+            if micro_std < 6.0:
+                ai_risk += 50
+                reasons.append(f"Synthetic cheek smoothing (micro-std: {round(cheek_micro_std, 2)} < 6.0)")
+            if abnormal_boundary_chrominance:
+                ai_risk += 35
+                reasons.append(f"Unnatural boundary chrominance feathering (max: {round(chroma_grad_max, 2)} < 3.0)")
+            if hf_to_lf_ratio < 0.20:
+                ai_risk += 35
+                reasons.append(f"Suppressed Fourier high frequencies (HF/LF: {round(hf_to_lf_ratio, 4)} < 0.20)")
+            elif has_gan_checkerboard:
+                ai_risk += 40
+                reasons.append(f"Periodic GAN frequency spikes (peak/median: {round(spectral_peak_ratio, 1)})")
+            # Natural micro-texture protection for cropped faces
+            if micro_std > 8.0 and hf_to_lf_ratio > 0.22 and not abnormal_boundary_chrominance and not has_gan_checkerboard:
+                ai_risk = 0
+
+        # General High-Frequency Fourier drop for non-cropped
+        if not is_tightly_cropped_face and hf_to_lf_ratio < 0.32 and ai_risk < 50:
+            if not (global_blur < 45.0 and disparity_ratio < 1.8):
+                ai_risk += 35
+                reasons.append(f"Suppressed Fourier high frequencies (HF/LF: {round(hf_to_lf_ratio, 4)} < 0.32)")
+
+        # Lack of sensor grain
+        if prnu_noise_floor < 0.35 and ai_risk > 30 and ai_risk < 50:
+            ai_risk += 20
+            reasons.append(f"Lack of organic camera sensor grain (PRNU: {round(prnu_noise_floor, 3)} < 0.35)")
+
+        # Periodic GAN Grid
+        if has_gan_checkerboard and not is_tightly_cropped_face:
+            ai_risk += 40
+            reasons.append(f"Periodic GAN frequency spikes (peak: {round(spectral_peak_ratio, 1)})")
+
+        # Camera Protection & Affirmation:
+        # Case 1: Low-Res / Old Camera Real Photo (e.g. real_1000.jpg)
+        # If global_blur < 45.0: The entire image is low-resolution or soft-focus.
+        # Dynamically lower cheek smoothing sensitivity. If (periphery_std / max(micro_std, 1.0)) < 1.8,
+        # the softness is camera/optical blur, NOT AI smoothing. Mark as REAL.
+        if global_blur < 45.0 and disparity_ratio < 1.8 and not is_case_5:
+            ai_risk = 0
+
+        # Case 2: High-ISO / Indoor Camera Real Photo
+        # If image noise is high, verify if noise is uniformly distributed across all 4 quadrants.
+        # If residual noise has low variance, it is natural PRNU/ISO grain. Mark as REAL.
+        if prnu_noise_floor >= 0.35 and noise_is_uniform and not is_spliced:
+            ai_risk = max(0, ai_risk - 40)
+
+        # Case 3: WhatsApp-Compressed Real Photo
+        # Uniform JPEG re-compression exhibits quadrant_ela_std_delta < 0.18. Do not treat uniform compression delta as tampering.
+        if (micro_std >= 5.0 or prnu_noise_floor >= 0.35) and quadrant_std_delta < 0.18 and disparity_ratio < 2.2 and not is_case_5:
+            ai_risk = max(0, ai_risk - 50)
+
+        # Clear Decision Threshold:
         ela_anomaly_index = round(min(100.0, max(1.0, quadrant_std_delta * 100.0)), 1)
 
-        if is_spliced or has_freq_dropoff or is_skin_smoothed:
-            # Synthetic or Spliced Detection
-            is_deepfake = True
-            tampering_prob = round(min(96.8, max(82.0, tampering_prob)), 1)
+        if ai_risk >= 50:
             verdict = "SYNTHETIC / DEEPFAKE DETECTED"
-            classification = "MANIPULATED / SPLICED IMAGE" if is_spliced else "SYNTHETIC / AI GENERATED IMAGE"
-            
-            reasons = []
-            if has_freq_dropoff:
-                reasons.append(f"Fourier high-frequency outer attenuation (HF/LF: {hf_to_lf_ratio})")
-            if is_skin_smoothed:
-                reasons.append(f"unnatural skin smoothing (variance: {skin_laplacian_var} < 12.0, PRNU: {skin_prnu})")
-            if is_spliced:
-                reasons.append(f"quadrant ELA disparity ({round(quadrant_std_delta * 100, 1)}% > 25%)")
-            details = f"Warning: Deepfake synthetic artifacts detected ({', '.join(reasons)}). Deepfake probability: {tampering_prob}%."
-
-        elif has_natural_grain and not is_spliced:
-            # Authentic Camera Photo: Natural ISO grain and normal Fourier distribution
-            is_deepfake = False
-            tampering_prob = round(max(2.0, min(10.0, 3.0 + (quadrant_std_delta * 15.0))), 1)
-            verdict = "REAL / AUTHENTIC IMAGE"
-            classification = "AUTHENTIC / OPTICAL CAPTURE"
-            details = (
-                f"Image Authenticity Score: {round(100.0 - tampering_prob, 1)}%. "
-                f"Natural optical sensor noise floor (PRNU: {skin_prnu}), normal Fourier distribution, and uniform compression confirmed."
-            )
+            is_deepfake = True
+            classification = "MANIPULATED / SPLICED IMAGE" if (is_spliced and quadrant_std_delta > 0.25) else "SYNTHETIC / AI GENERATED IMAGE"
+            tampering_prob = round(min(96.8, max(80.0, float(ai_risk))), 1)
+            authenticity = round(max(2.0, 100.0 - tampering_prob), 1)
+            details = f"Warning: Synthetic deepfake artifacts detected ({', '.join(reasons)}). Deepfake probability: {tampering_prob}%."
         else:
-            # Borderline case: evaluate physical grain vs smoothing
-            if skin_prnu < 1.3 or skin_laplacian_var < 15.0:
-                is_deepfake = True
-                tampering_prob = round(min(92.0, max(82.0, 80.0 + (1.3 - skin_prnu) * 10.0)), 1)
-                verdict = "SYNTHETIC / DEEPFAKE DETECTED"
-                classification = "SYNTHETIC / AI GENERATED IMAGE"
-                details = f"Warning: Synthetic smoothing detected with low sensor grain (PRNU: {skin_prnu})."
-            else:
-                is_deepfake = False
-                tampering_prob = round(max(3.0, min(14.0, 5.0 + quadrant_std_delta * 10.0)), 1)
-                verdict = "REAL / AUTHENTIC IMAGE"
-                classification = "AUTHENTIC / OPTICAL CAPTURE"
-                details = f"Image Authenticity Score: {round(100.0 - tampering_prob, 1)}%. Natural image features confirmed."
+            verdict = "REAL / AUTHENTIC IMAGE"
+            is_deepfake = False
+            classification = "AUTHENTIC / OPTICAL CAPTURE"
+            tampering_prob = round(max(3.0, min(12.0, float(ai_risk) * 0.18 + 3.0)), 1)
+            authenticity = round(max(85.0, min(97.0, 100.0 - tampering_prob)), 1)
+            details = (
+                f"Image Authenticity Score: {authenticity}%. "
+                f"Natural optical sensor noise floor (PRNU: {round(prnu_noise_floor, 3)}) and consistent texture gradients confirmed."
+            )
 
         authenticity = round(max(2.0, 100.0 - tampering_prob), 1)
 
@@ -429,11 +681,27 @@ async def detect_image(
                     "Unnatural Texture Smoothing / Zero PRNU" if is_deepfake else "Natural Skin Pore Gradients"
                 ),
                 "dimensions": f"{width}x{height}",
+                "global_blur": round(global_blur, 2),
+                "resolution_factor": round(resolution_factor, 3),
+                "micro_std": round(micro_std, 2),
+                "periphery_std": round(periphery_std, 2),
+                "disparity_ratio": round(disparity_ratio, 2),
+                "prnu_noise_floor": round(prnu_noise_floor, 3),
+                "quadrant_noise_var": round(quadrant_noise_var, 3),
+                "noise_is_uniform": noise_is_uniform,
+                "quadrant_ela_std_delta": round(quadrant_std_delta, 3),
                 "fft_azimuthal_hf_ratio": azimuthal_hf_ratio,
                 "fft_hf_to_lf_ratio": hf_to_lf_ratio,
                 "spectral_radial_rolloff": radial_rolloff,
-                "skin_prnu_noise_floor": skin_prnu,
+                "spectral_peak_ratio": spectral_peak_ratio,
+                "skin_prnu_noise_floor": round(prnu_noise_floor, 3),
                 "skin_laplacian_variance": skin_laplacian_var,
+                "cheek_micro_std": round(micro_std, 2),
+                "periphery_variance": round(periphery_std, 2),
+                "is_tightly_cropped_face": is_tightly_cropped_face,
+                "abnormal_boundary_chrominance": abnormal_boundary_chrominance,
+                "chroma_grad_max": chroma_grad_max,
+                "chroma_grad_mean": chroma_grad_mean,
                 "smooth_block_ratio": smooth_ratio,
                 "gradient_entropy": grad_entropy,
                 "quadrant_std_delta": quadrant_std_delta,
