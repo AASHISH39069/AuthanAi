@@ -1,0 +1,122 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply bg-[#f8fafc] text-slate-900 min-h-screen overflow-x-hidden;
+    font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  }
+
+  code, pre, .font-mono {
+    font-family: 'JetBrains Mono', monospace;
+  }
+}
+
+/* Subtle Cybersecurity / AI Grid Background Pattern */
+.cyber-grid-bg {
+  background-color: #f8fafc;
+  background-image: radial-gradient(rgba(148, 163, 184, 0.35) 1.2px, transparent 1.2px);
+  background-size: 24px 24px;
+}
+
+/* Glassmorphic Light Cards */
+.glass-card {
+  background: rgba(255, 255, 255, 0.82);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  border: 1px solid rgba(226, 232, 240, 0.85);
+  box-shadow: 0 4px 20px -4px rgba(15, 23, 42, 0.05), 0 2px 6px -1px rgba(15, 23, 42, 0.02);
+  transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.glass-card:hover {
+  border-color: rgba(59, 130, 246, 0.45);
+  box-shadow: 0 12px 30px -8px rgba(37, 99, 235, 0.12), 0 4px 12px -2px rgba(15, 23, 42, 0.04);
+  transform: translateY(-2px);
+}
+
+.glass-panel {
+  background: rgba(255, 255, 255, 0.92);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid rgba(226, 232, 240, 0.9);
+  box-shadow: 0 10px 35px -5px rgba(15, 23, 42, 0.06);
+}
+
+/* Soft Glow Effects for Light Theme */
+.light-glow-blue {
+  box-shadow: 0 0 35px -5px rgba(37, 99, 235, 0.18);
+}
+
+.light-glow-purple {
+  box-shadow: 0 0 35px -5px rgba(124, 58, 237, 0.16);
+}
+
+.light-glow-emerald {
+  box-shadow: 0 0 30px -5px rgba(16, 185, 129, 0.18);
+}
+
+/* Pure CSS 4-Slide Feature Carousel */
+.css-slider-container {
+  position: relative;
+  overflow: hidden;
+  width: 100%;
+}
+
+.css-slider-track {
+  display: flex;
+  width: 400%;
+  transition: transform 0.6s cubic-bezier(0.25, 1, 0.5, 1);
+}
+
+.css-slide {
+  width: 25%;
+  flex-shrink: 0;
+}
+
+#slide-1:checked ~ .css-slider-track {
+  transform: translateX(0%);
+}
+
+#slide-2:checked ~ .css-slider-track {
+  transform: translateX(-25%);
+}
+
+#slide-3:checked ~ .css-slider-track {
+  transform: translateX(-50%);
+}
+
+#slide-4:checked ~ .css-slider-track {
+  transform: translateX(-75%);
+}
+
+/* Active tab button highlight via sibling selectors */
+#slide-1:checked ~ .css-slider-nav label[for="slide-1"],
+#slide-2:checked ~ .css-slider-nav label[for="slide-2"],
+#slide-3:checked ~ .css-slider-nav label[for="slide-3"],
+#slide-4:checked ~ .css-slider-nav label[for="slide-4"] {
+  background: #2563eb;
+  color: #ffffff;
+  border-color: #2563eb;
+  box-shadow: 0 4px 12px rgba(37, 99, 235, 0.3);
+}
+
+/* Custom Clean Scrollbar */
+::-webkit-scrollbar {
+  width: 7px;
+  height: 7px;
+}
+
+::-webkit-scrollbar-track {
+  background: #f1f5f9;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}
